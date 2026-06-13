@@ -1,0 +1,95 @@
+name: AWS Hosted Packer Host Repro
+
+on:
+  workflow_dispatch:
+    inputs:
+      host_instance_type:
+        description: "Packer host EC2 instance type"
+        required: true
+        default: "t4g.micro"
+        type: string
+      target_transport:
+        description: "Target transport"
+        required: true
+        default: "session_manager"
+        type: choice
+        options:
+          - ssh
+          - session_manager
+      target_scenario:
+        description: "Target scenario"
+        required: true
+        default: "ansible"
+        type: choice
+        options:
+          - shell
+          - ansible
+      target_source_os:
+        description: "Target source OS"
+        required: true
+        default: "ubuntu"
+        type: choice
+        options:
+          - ubuntu
+          - amazonlinux
+      target_architecture:
+        description: "Target architecture"
+        required: true
+        default: "x86_64"
+        type: choice
+        options:
+          - x86_64
+          - arm64
+      target_instance_type:
+        description: "Target EC2 instance type"
+        required: true
+        default: "t3.micro"
+        type: string
+      target_line_count:
+        description: "Target line count"
+        required: true
+        default: "1000"
+        type: string
+      target_timeout_minutes:
+        description: "Target build timeout"
+        required: true
+        default: "6"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    env:
+      AWS_REGION: ${{ vars.PACKER_REPRO_REGION }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via static secrets
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.PACKER_REPRO_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+
+      - name: Run AWS-hosted host repro
+        shell: bash
+        run: |
+          set -euxo pipefail
+          REPO_REF="${GITHUB_REF_NAME}" \
+          HOST_INSTANCE_TYPE="${{ inputs.host_instance_type }}" \
+          TARGET_TRANSPORT="${{ inputs.target_transport }}" \
+          TARGET_SCENARIO="${{ inputs.target_scenario }}" \
+          TARGET_SOURCE_OS="${{ inputs.target_source_os }}" \
+          TARGET_ARCHITECTURE="${{ inputs.target_architecture }}" \
+          TARGET_INSTANCE_TYPE="${{ inputs.target_instance_type }}" \
+          TARGET_LINE_COUNT="${{ inputs.target_line_count }}" \
+          TARGET_TIMEOUT_MINUTES="${{ inputs.target_timeout_minutes }}" \
+          tools/sshrelaybench/run-aws-hosted-packer-repro.sh

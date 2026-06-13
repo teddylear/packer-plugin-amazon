@@ -1,0 +1,211 @@
+name: AWS SSH Relay Repro Ansible
+
+on:
+  workflow_dispatch:
+    inputs:
+      transport:
+        description: "Transport to test"
+        required: true
+        default: "session_manager"
+        type: choice
+        options:
+          - ssh
+          - session_manager
+      line_count:
+        description: "How many stdout lines the provisioner should emit"
+        required: true
+        default: "1000"
+        type: string
+      source_os:
+        description: "Source image family"
+        required: true
+        default: "ubuntu"
+        type: choice
+        options:
+          - ubuntu
+          - amazonlinux
+      architecture:
+        description: "Source image architecture"
+        required: true
+        default: "x86_64"
+        type: choice
+        options:
+          - x86_64
+          - arm64
+      instance_type:
+        description: "EC2 instance type"
+        required: true
+        default: "t3.micro"
+        type: string
+      timeout_minutes:
+        description: "Hard timeout for packer build step"
+        required: true
+        default: "10"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  repro:
+    name: ${{ matrix.case_name }} (${{ inputs.transport }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case_name: v180
+            plugin_version: 1.8.0
+          - case_name: v181
+            plugin_version: 1.8.1
+
+    env:
+      AWS_REGION: ${{ vars.PACKER_REPRO_REGION }}
+      PACKER_LOG: "1"
+      REPRO_RUN_ID: gha-${{ github.run_id }}-${{ matrix.case_name }}-${{ inputs.transport }}-ansible
+      REPRO_LOG: repro-${{ matrix.case_name }}-${{ inputs.transport }}-ansible.log
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Packer
+        uses: hashicorp/setup-packer@v3
+
+      - name: Install Ansible
+        shell: bash
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y ansible-core
+          ansible --version
+
+      - name: Configure AWS credentials via OIDC
+        if: ${{ vars.AWS_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.PACKER_REPRO_REGION }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-packer-repro-${{ github.run_id }}
+
+      - name: Configure AWS credentials via static secrets
+        if: ${{ vars.AWS_ROLE_ARN == '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.PACKER_REPRO_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+
+      - name: Validate repro inputs
+        shell: bash
+        run: |
+          set -eu
+          test -n "$AWS_REGION" || { echo "Missing repo variable PACKER_REPRO_REGION"; exit 1; }
+          test -n "${{ vars.PACKER_REPRO_SUBNET_ID }}" || { echo "Missing repo variable PACKER_REPRO_SUBNET_ID"; exit 1; }
+          if [ "${{ inputs.transport }}" = "session_manager" ] && [ -z "${{ vars.PACKER_REPRO_SSM_INSTANCE_PROFILE }}" ]; then
+            echo "Missing repo variable PACKER_REPRO_SSM_INSTANCE_PROFILE for session_manager transport"
+            exit 1
+          fi
+
+      - name: Verify AWS identity
+        shell: bash
+        run: aws sts get-caller-identity
+
+      - name: Write plugin version pin
+        shell: bash
+        run: |
+          cat > tools/sshrelaybench/repro-ansible/version.auto.pkr.hcl <<'EOF'
+          packer {
+            required_plugins {
+              amazon = {
+                source  = "github.com/hashicorp/amazon"
+                version = "=${{ matrix.plugin_version }}"
+              }
+              ansible = {
+                source  = "github.com/hashicorp/ansible"
+                version = "=1.1.4"
+              }
+            }
+          }
+          EOF
+
+      - name: Packer init
+        shell: bash
+        run: packer init tools/sshrelaybench/repro-ansible
+
+      - name: Run repro build
+        id: build
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          timeout --signal=INT "${{ inputs.timeout_minutes }}m" \
+            packer build -color=false \
+              -var "region=$AWS_REGION" \
+              -var "subnet_id=${{ vars.PACKER_REPRO_SUBNET_ID }}" \
+              -var "transport=${{ inputs.transport }}" \
+              -var "run_id=$REPRO_RUN_ID" \
+              -var "line_count=${{ inputs.line_count }}" \
+              -var "instance_type=${{ inputs.instance_type }}" \
+              -var "source_os=${{ inputs.source_os }}" \
+              -var "architecture=${{ inputs.architecture }}" \
+              -var "source_ami=${{ vars.PACKER_REPRO_SOURCE_AMI }}" \
+              -var "ssm_instance_profile=${{ vars.PACKER_REPRO_SSM_INSTANCE_PROFILE }}" \
+              tools/sshrelaybench/repro-ansible 2>&1 | tee "$REPRO_LOG"
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload repro log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.REPRO_LOG }}
+          path: ${{ env.REPRO_LOG }}
+
+      - name: Cleanup instances, keypairs, and security groups
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          instance_ids=$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:ssh-relay-repro-run-id,Values=$REPRO_RUN_ID" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+          if [ -n "$instance_ids" ] && [ "$instance_ids" != "None" ]; then
+            aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids $instance_ids >/dev/null 2>&1 || true
+          fi
+
+          key_names=$(aws ec2 describe-key-pairs \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:ssh-relay-repro-run-id,Values=$REPRO_RUN_ID" \
+            --query 'KeyPairs[].KeyName' \
+            --output text)
+          if [ -n "$key_names" ] && [ "$key_names" != "None" ]; then
+            for key_name in $key_names; do
+              aws ec2 delete-key-pair --region "$AWS_REGION" --key-name "$key_name" >/dev/null 2>&1 || true
+            done
+          fi
+
+          group_ids=$(aws ec2 describe-security-groups \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:ssh-relay-repro-run-id,Values=$REPRO_RUN_ID" \
+            --query 'SecurityGroups[].GroupId' \
+            --output text)
+          if [ -n "$group_ids" ] && [ "$group_ids" != "None" ]; then
+            for group_id in $group_ids; do
+              aws ec2 delete-security-group --region "$AWS_REGION" --group-id "$group_id" >/dev/null 2>&1 || true
+            done
+          fi
+
+      - name: Fail job when build failed
+        if: ${{ steps.build.outputs.status != '0' }}
+        shell: bash
+        run: |
+          echo "Packer build exited with status ${{ steps.build.outputs.status }}"
+          exit 1

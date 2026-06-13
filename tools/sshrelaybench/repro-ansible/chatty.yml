@@ -1,0 +1,86 @@
+- hosts: all
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Refresh package metadata
+      shell: |
+        set -e
+        if command -v apt-get >/dev/null 2>&1; then
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+        else
+          yum makecache -y
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Install common tools
+      shell: |
+        set -e
+        if command -v apt-get >/dev/null 2>&1; then
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y curl tar unzip zip
+        else
+          yum install -y curl tar unzip zip
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Collect environment noise
+      shell: |
+        set -euo pipefail
+        printf 'host=%s\n' "$(hostname)"
+        printf 'kernel=%s\n' "$(uname -srmo)"
+        printf 'working_dir=%s\n' "$PWD"
+        df -h / || true
+        free -m || true
+        lscpu | sed -n '1,12p' || true
+      args:
+        executable: /bin/bash
+
+    - name: Exercise filesystem and archives
+      shell: |
+        set -euo pipefail
+        workdir=$(mktemp -d /tmp/sshrelaybench.XXXXXX)
+        trap 'rm -rf "$workdir"' EXIT
+        printf 'payload-%s\n' "$(date -u +%s)" > "$workdir/payload.txt"
+        for i in $(seq 1 25); do
+          printf 'file-%02d %s\n' "$i" "$(printf '%0.sx' $(seq 1 16))" >> "$workdir/payload.txt"
+        done
+        tar -C "$workdir" -czf "$workdir/payload.tar.gz" payload.txt
+        tar -C "$workdir" -xzf "$workdir/payload.tar.gz"
+        if command -v unzip >/dev/null 2>&1; then
+          cp "$workdir/payload.txt" "$workdir/payload.zipdir.txt"
+          (cd "$workdir" && zip -q payload.zip payload.zipdir.txt)
+          unzip -q "$workdir/payload.zip" -d "$workdir/unzipped"
+        fi
+        sha256sum "$workdir"/payload.* || true
+      args:
+        executable: /bin/bash
+
+    - name: Emit relay lines
+      shell: |
+        set -euo pipefail
+        for i in $(seq 1 {{ line_count }}); do
+          printf 'relay-line %06d %s\n' "$i" 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+          if [ $((i % 50)) -eq 0 ]; then
+            printf 'relay-stderr %06d %s\n' "$i" 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' >&2
+            sleep 0.2
+          elif [ $((i % 137)) -eq 0 ]; then
+            printf 'relay-stderr %06d %s\n' "$i" 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz' >&2
+          fi
+        done
+        echo relay-finished
+      args:
+        executable: /bin/bash
+
+    - name: Create cleanup marker
+      file:
+        path: /tmp/sshrelaybench-marker
+        state: touch
+
+    - name: Remove cleanup marker
+      file:
+        path: /tmp/sshrelaybench-marker
+        state: absent
